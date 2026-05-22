@@ -20,8 +20,8 @@
 set -euo pipefail
 
 MODULE_NAME="myfs"
-KMOD="kernel/myfs.ko"
-TOOL="userspace/myfs_tool"
+KMOD="myfs.ko"
+TOOL="myfs_tool"
 
 DEV="${2:-sdb}"
 SB1="${3:-0}"
