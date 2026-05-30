@@ -2,12 +2,13 @@
 # deploy.sh — вспомогательный скрипт для загрузки/тестирования/выгрузки MyFS.
 #
 # Использование:
-#   ./deploy.sh load    [dev] [sb1] [sb2] [name_len] [file_sectors]
+#   ./deploy.sh load    [dev] [sb1] [sb2] [name_len] [file_sectors] [format]
 #   ./deploy.sh mount   [mountpoint]
 #   ./deploy.sh test    [mountpoint]
 #   ./deploy.sh umount  [mountpoint]
 #   ./deploy.sh unload
 #   ./deploy.sh status
+#   ./deploy.sh erase-test [mountpoint]   # проверка: после erase mount падает
 #
 # Значения по умолчанию:
 #   dev           = sdb
@@ -15,6 +16,7 @@
 #   sb2           = 1
 #   name_len      = 64
 #   file_sectors  = 8
+#   format        = 0   (1 — отформатировать устройство при загрузке)
 #   mountpoint    = /mnt
 
 set -euo pipefail
@@ -28,6 +30,7 @@ SB1="${3:-0}"
 SB2="${4:-1}"
 NLEN="${5:-64}"
 FSECT="${6:-8}"
+FMT="${7:-0}"
 MNT="${2:-/mnt}"
 
 # Цвета для вывода
@@ -48,13 +51,14 @@ load)
         exit 1
     fi
     info "Loading myfs.ko (dev=${DEV}, sb1=${SB1}, sb2=${SB2}, " \
-         "name_len=${NLEN}, file_sectors=${FSECT})"
+         "name_len=${NLEN}, file_sectors=${FSECT}, format=${FMT})"
     insmod "${KMOD}" \
-        dev_name="${DEV}" \
+        myfs_dev="${DEV}" \
         sb_offset_1="${SB1}" \
         sb_offset_2="${SB2}" \
         max_name_len="${NLEN}" \
-        file_sectors="${FSECT}"
+        file_sectors="${FSECT}" \
+        format="${FMT}"
     info "Module loaded. dmesg tail:"
     dmesg | tail -5
     ;;
@@ -70,12 +74,29 @@ mount)
 
 # ── Тест чтения/записи ───────────────────────────────────────────────────
 test)
-    if [ ! -x "${TOOL}" ]; then
+    if [ ! -x "./${TOOL}" ]; then
         info "Building userspace tool..."
-        make -C userspace
+        make tool
     fi
     info "Running R/W test on ${MNT}..."
-    "${TOOL}" --test "${MNT}"
+    "./${TOOL}" test "${MNT}"
+    ;;
+
+# ── Тест erase: после стирания ФС повторный mount обязан упасть ────────────
+erase-test)
+    info "ERASE test: wiping FS and asserting that re-mount fails"
+    if [ ! -x "./${TOOL}" ]; then make tool; fi
+    echo yes | "./${TOOL}" erase
+    info "Unmounting ${MNT}"
+    umount "${MNT}" || true
+    info "Attempting plain re-mount (must FAIL)..."
+    if mount -t myfs none "${MNT}" 2>/dev/null; then
+        error "FAIL: mount succeeded after erase — data would have been lost!"
+        umount "${MNT}" || true
+        exit 1
+    else
+        info "OK: mount correctly refused after erase (both superblocks invalid)."
+    fi
     ;;
 
 # ── Размонтирование ───────────────────────────────────────────────────────
@@ -109,7 +130,7 @@ status)
 
 # ── Полный цикл: загрузить → смонтировать → тест → размонтировать → выгрузить
 full)
-    bash "$0" load  "${DEV}" "${SB1}" "${SB2}" "${NLEN}" "${FSECT}"
+    bash "$0" load  "${DEV}" "${SB1}" "${SB2}" "${NLEN}" "${FSECT}" 1
     bash "$0" mount /mnt
     bash "$0" test  /mnt
     echo ""
@@ -119,14 +140,15 @@ full)
     ;;
 
 help|--help|-h|*)
-    echo "Usage: $0 {load|mount|umount|unload|test|status|full} [args]"
+    echo "Usage: $0 {load|mount|umount|unload|test|status|erase-test|full} [args]"
     echo ""
-    echo "  load   [dev] [sb1] [sb2] [name_len] [file_sectors]"
+    echo "  load   [dev] [sb1] [sb2] [name_len] [file_sectors] [format]"
     echo "  mount  [mountpoint]"
     echo "  test   [mountpoint]"
     echo "  umount [mountpoint]"
     echo "  unload"
     echo "  status"
+    echo "  erase-test [mountpoint]"
     echo "  full   [dev] [sb1] [sb2] [name_len] [file_sectors]"
     ;;
 esac

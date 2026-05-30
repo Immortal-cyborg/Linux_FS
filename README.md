@@ -3,15 +3,12 @@
 ## Структура проекта
 
 ```
-myfs/
+Linux_FS/
 ├── myfs.h                  # Общие определения (ядро + userspace)
-├── kernel/
-│   ├── myfs_module.c       # Модуль ядра
-│   └── Makefile
-├── userspace/
-│   ├── myfs_tool.cpp       # Тестовая программа (C++17)
-│   └── Makefile
-├── deploy.sh               # Скрипт для загрузки / монтирования / тестирования
+├── myfs_module.c           # Модуль ядра
+├── myfs_tool.cpp           # Тестовая программа (C++17)
+├── Makefile                # Собирает И модуль, И утилиту
+├── deploy.sh               # Скрипт загрузки / монтирования / тестирования
 └── README.md
 ```
 
@@ -39,11 +36,12 @@ myfs/
 
 | Параметр        | Тип   | По умолчанию | Описание                               |
 |-----------------|-------|--------------|----------------------------------------|
-| `dev_name`      | charp | `sdb`        | Блочное устройство (`/dev/<dev_name>`) |
+| `myfs_dev`      | charp | `sdb`        | Блочное устройство (`/dev/<myfs_dev>`) |
 | `sb_offset_1`   | int   | `0`          | Сектор первой копии суперблока         |
 | `sb_offset_2`   | int   | `1`          | Сектор второй копии суперблока         |
 | `max_name_len`  | int   | `64`         | Максимальная длина имени файла         |
 | `file_sectors`  | int   | `8`          | Число секторов на файл (M)             |
+| `format`        | int   | `0`          | `1` — отформатировать устройство при монтировании |
 
 ---
 
@@ -55,8 +53,14 @@ myfs/
 При монтировании:
 1. Читается первичная копия (сектор `sb_offset_1`).
 2. Проверяются `magic == MYFS_MAGIC` и `checksum`.
-3. Если проверка не прошла — читается резервная копия (`sb_offset_2`).
-4. Если обе повреждены — устройство форматируется заново.
+3. Если первичная повреждена, но резервная (`sb_offset_2`) исправна —
+   используется резервная, а первичная **восстанавливается** из неё.
+4. Если **обе** копии повреждены — монтирование завершается ошибкой
+   (`-EINVAL`), устройство **НЕ форматируется** (данные не теряются).
+   Создать ФС заново можно явно: загрузить модуль с `format=1`.
+
+Так после `erase` (обнуление обоих суперблоков) обычный повторный
+`mount` корректно падает, а не переформатирует диск.
 
 ---
 
@@ -73,26 +77,18 @@ myfs/
 
 ## Быстрый старт
 
-### 1. Сборка модуля ядра
+### 1. Сборка модуля и утилиты
 
 ```bash
 # Убедитесь, что установлены заголовки ядра:
 sudo apt install linux-headers-$(uname -r)
 
-cd myfs/kernel
-make
-# Результат: myfs.ko
+make # собирает И myfs.ko, И myfs_tool
+#   make modules     # только myfs.ko
+#   make tool        # только myfs_tool
 ```
 
-### 2. Сборка userspace-утилиты
-
-```bash
-cd myfs/userspace
-make
-# Результат: myfs_tool
-```
-
-### 3. Подготовка виртуального блочного устройства (для тестов)
+### 2. Подготовка виртуального блочного устройства (для тестов)
 
 ```bash
 # Создаём образ 10 МБ
@@ -102,35 +98,36 @@ dd if=/dev/zero of=/tmp/myfs.img bs=1M count=10
 sudo losetup /dev/loop0 /tmp/myfs.img
 ```
 
-### 4. Загрузка модуля
+### 3. Загрузка модуля
 
 ```bash
-# Устройство loop0, суперблок на секторах 0 и 1, файлы по 4 сектора
-sudo insmod kernel/myfs.ko dev_name=loop0 sb_offset_1=0 sb_offset_2=1 \
-     max_name_len=32 file_sectors=4
+# Устройство loop0, суперблок на секторах 0 и 1, файлы по 4 сектора.
+# format=1 — создать ФС заново (нужно при первом использовании устройства).
+sudo insmod myfs.ko myfs_dev=loop0 sb_offset_1=0 sb_offset_2=1 \
+     max_name_len=32 file_sectors=4 format=1
 ```
 
-### 5. Монтирование
+### 4. Монтирование
 
 ```bash
 sudo mount -t myfs none /mnt
 ls /mnt         # должны появиться файлы вида file00000, file00001, …
 ```
 
-### 6. Тестирование
+### 5. Тестирование
 
 ```bash
 # Записывает случайное число в каждый файл и читает обратно
-sudo ./userspace/myfs_tool --test /mnt
+sudo ./myfs_tool test /mnt
 
 # IOCTL-команды
-sudo ./userspace/myfs_tool --get-meta /mnt
-sudo ./userspace/myfs_tool --sector-map 3
-sudo ./userspace/myfs_tool --zero-all
-sudo ./userspace/myfs_tool --erase-fs
+sudo ./myfs_tool metadata /mnt
+sudo ./myfs_tool sectormap file00003
+sudo ./myfs_tool zero
+sudo ./myfs_tool erase
 ```
 
-### 7. Размонтирование и выгрузка
+### 6. Размонтирование и выгрузка
 
 ```bash
 sudo umount /mnt
@@ -143,16 +140,19 @@ sudo losetup -d /dev/loop0
 ```bash
 chmod +x deploy.sh
 
-# Полный цикл на loop0 с параметрами по умолчанию:
+# Полный цикл на loop0 с параметрами по умолчанию (load выполняет format=1):
 sudo ./deploy.sh full loop0
 
-# Или пошагово:
-sudo ./deploy.sh load  loop0 0 1 32 4
+# Или пошагово (format=1 в 7-м аргументе load — создать ФС):
+sudo ./deploy.sh load  loop0 0 1 32 4 1
 sudo ./deploy.sh mount /mnt
 sudo ./deploy.sh test  /mnt
 sudo ./deploy.sh status
 sudo ./deploy.sh umount /mnt
 sudo ./deploy.sh unload
+
+# Проверка сценария erase (mount после erase обязан упасть):
+sudo ./deploy.sh erase-test /mnt
 ```
 
 ---
@@ -169,8 +169,10 @@ sudo ./deploy.sh unload
 ## Версия ядра
 
 Проверено на Linux **6.12.x**. Использует API:
-- `blkdev_get_by_path` / `blkdev_put` (6.5+)
-- `bdev_nr_sectors` (6.0+)
+- `bdev_file_open_by_path` / `file_bdev` / `fput` (6.9+)
+- `bio_alloc` / `bio_add_page` / `submit_bio_wait` — весь I/O через bio
+- `bdev_logical_block_size` — автоопределение размера сектора
+- `bdev_nr_bytes`
 - `mount_nodev` / `kill_anon_super`
 - `misc_register` для IOCTL-устройства
 - `crc32()` из `<linux/crc32.h>`

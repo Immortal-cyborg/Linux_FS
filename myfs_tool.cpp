@@ -5,20 +5,20 @@
  *   1. Обход всего диска: в каждый файл записывается случайное число,
  *      затем оно читается обратно — проверяется корректность.
  *   2. CLI-интерфейс для вызова IOCTL-команд:
- *        --zero-all        Обнулить все файлы
- *        --erase-fs        Стереть ФС (обнулить суперблоки)
- *        --get-meta        Получить хеши всех файлов
- *        --sector-map N    Получить маппинг секторов для файла N
+ *        zero                  Обнулить все файлы
+ *        erase                 Стереть ФС (обнулить суперблоки)
+ *        metadata              Получить хеши всех файлов
+ *        sectormap <filename>  Получить маппинг секторов для файла
  *
  * Сборка:
- *   g++ -std=c++17 -Wall -O2 -I.. -o myfs_tool myfs_tool.cpp
+ *   g++ -std=c++17 -Wall -O2 -o myfs_tool myfs_tool.cpp
  *
  * Примеры:
- *   sudo ./myfs_tool --test /mnt
- *   sudo ./myfs_tool --zero-all
- *   sudo ./myfs_tool --get-meta /mnt
- *   sudo ./myfs_tool --sector-map 5
- *   sudo ./myfs_tool --erase-fs
+ *   sudo ./myfs_tool test /mnt
+ *   sudo ./myfs_tool zero
+ *   sudo ./myfs_tool metadata /mnt
+ *   sudo ./myfs_tool sectormap file00005
+ *   sudo ./myfs_tool erase
  */
 
 #include <iostream>
@@ -39,8 +39,8 @@
 #include <sys/ioctl.h>
 #include <errno.h>
 
-/* Общий заголовок с IOCTL-определениями (находится в родительском каталоге) */
-#include "../myfs.h"
+/* Общий заголовок с IOCTL-определениями (в корне проекта рядом с этим файлом) */
+#include "myfs.h"
 
 static constexpr const char *CTL_DEV = "/dev/myfs_ctl";
 
@@ -188,7 +188,8 @@ static void ioctl_erase_fs()
     ::close(fd);
     if (rc < 0)
         throw std::runtime_error(std::string("ERASE_FS: ") + ::strerror(errno));
-    std::cout << "✓ FS erased. Unmount and reload module to reformat.\n";
+    std::cout << "✓ FS erased and invalidated. A plain re-mount will now FAIL;\n"
+              << "  use format=1 module param to create the filesystem anew.\n";
 }
 
 /**
@@ -232,26 +233,27 @@ static void ioctl_get_meta(const std::string &mount_point)
     }
 }
 
-/** Вывести маппинг секторов для файла с индексом file_index. */
-static void ioctl_sector_map(uint32_t file_index)
+/** Вывести маппинг секторов для файла по имени. */
+static void ioctl_sector_map(const std::string &filename)
 {
     myfs_sector_map map{};
-    map.file_index = file_index;
+    std::strncpy(map.name, filename.c_str(), sizeof(map.name) - 1);
 
     int fd = open_ctl();
     int rc = ::ioctl(fd, MYFS_IOC_GET_SECTOR_MAP, &map);
     ::close(fd);
     if (rc < 0)
-        throw std::runtime_error(std::string("GET_SECTOR_MAP: ") +
-                                 ::strerror(errno));
+        throw std::runtime_error(std::string("GET_SECTOR_MAP '") + filename +
+                                 "': " + ::strerror(errno));
 
-    uint64_t b_start = static_cast<uint64_t>(map.start_sector) * MYFS_SECTOR_SIZE;
+    uint64_t b_start = static_cast<uint64_t>(map.start_sector) * map.sector_size;
     uint64_t b_end   = static_cast<uint64_t>(map.start_sector + map.num_sectors)
-                       * MYFS_SECTOR_SIZE - 1;
+                       * map.sector_size - 1;
 
-    std::cout << "File #" << file_index << ":\n"
+    std::cout << "File \"" << filename << "\" (#" << map.file_index << "):\n"
               << "  start_sector : " << map.start_sector << "\n"
               << "  num_sectors  : " << map.num_sectors  << "\n"
+              << "  sector_size  : " << map.sector_size  << "\n"
               << "  byte range   : [" << b_start << " … " << b_end << "]\n";
 }
 
@@ -265,11 +267,11 @@ static void print_usage(const char *prog)
         << "MyFS userspace tool\n\n"
         << "Usage: " << prog << " <command> [arg]\n\n"
         << "Commands:\n"
-        << "  --test [mount]        R/W test on all files (default: /mnt)\n"
-        << "  --zero-all            IOCTL: zero all file contents\n"
-        << "  --erase-fs            IOCTL: wipe superblocks\n"
-        << "  --get-meta [mount]    IOCTL: print CRC32 metadata table\n"
-        << "  --sector-map <N>      IOCTL: sector mapping for file #N\n"
+        << "  test [mount]          R/W test on all files (default: /mnt)\n"
+        << "  zero                  IOCTL: zero all file contents\n"
+        << "  erase                 IOCTL: wipe superblocks (invalidate FS)\n"
+        << "  metadata [mount]      IOCTL: print CRC32 metadata table\n"
+        << "  sectormap <filename>  IOCTL: sector mapping for a file\n"
         << "  --help, -h            This help\n\n"
         << "Most commands require root.\n";
 }
@@ -284,13 +286,13 @@ int main(int argc, char *argv[])
     const std::string cmd = argv[1];
 
     try {
-        if      (cmd == "--test")       run_rw_test(argc >= 3 ? argv[2] : "/mnt");
-        else if (cmd == "--zero-all")   ioctl_zero_all();
-        else if (cmd == "--erase-fs")   ioctl_erase_fs();
-        else if (cmd == "--get-meta")   ioctl_get_meta(argc >= 3 ? argv[2] : "/mnt");
-        else if (cmd == "--sector-map") {
-            if (argc < 3) { std::cerr << "--sector-map needs file index\n"; return 1; }
-            ioctl_sector_map(static_cast<uint32_t>(std::stoul(argv[2])));
+        if      (cmd == "test")       run_rw_test(argc >= 3 ? argv[2] : "/mnt");
+        else if (cmd == "zero")       ioctl_zero_all();
+        else if (cmd == "erase")      ioctl_erase_fs();
+        else if (cmd == "metadata")   ioctl_get_meta(argc >= 3 ? argv[2] : "/mnt");
+        else if (cmd == "sectormap") {
+            if (argc < 3) { std::cerr << "sectormap needs a filename\n"; return 1; }
+            ioctl_sector_map(argv[2]);
         }
         else if (cmd == "--help" || cmd == "-h") print_usage(argv[0]);
         else { std::cerr << "Unknown: " << cmd << "\n"; print_usage(argv[0]); return 1; }

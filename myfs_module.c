@@ -17,30 +17,19 @@
  *   sb_offset_2   — сектор второй копии суперблока  (default 1)
  *   max_name_len  — максимальная длина имени файла   (default 64)
  *   file_sectors  — секторов на файл (M)             (default 8)
+ *   format        — 1 = форматировать устройство при монтировании
+ *                   (создать ФС заново). 0 = только монтировать
+ *                   существующую ФС, при двух повреждённых
+ *                   суперблоках вернуть ошибку.       (default 0)
  *
- * ── История изменений API blkdev (важно для понимания) ──────────────
- *  до 6.5:  blkdev_get_by_path() → struct block_device*
- *           blkdev_put(bdev, mode)
- *  6.5–6.8: bdev_open_by_path() → struct bdev_handle*    [bdev_h->bdev]
- *           bdev_release(handle)
- *  6.9+:    bdev_handle и bdev_open_by_path УБРАНЫ,
- *           bdev_file_open_by_path() → struct file*       [file_bdev(f)]
- *           fput(file)
- *
- * На Debian 13 ядро 6.12.88 → используем bdev_file_open_by_path / fput.
- *
- * ── История изменений API inode timestamps ──────────────────────────
- *  до 6.6:  inode->i_atime = inode->i_mtime = inode->i_ctime = ts;
- *  6.6+:    inode_set_{a,m,c}time_to_ts(inode, ts)
  */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/pagemap.h>
-#include <linux/buffer_head.h>
 #include <linux/blkdev.h>
+#include <linux/bio.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
@@ -62,18 +51,21 @@ static int   sb_offset_1 = MYFS_SB_OFFSET_1;
 static int   sb_offset_2 = MYFS_SB_OFFSET_2;
 static int   max_name_len= MYFS_MAX_NAME_LEN;
 static int   file_sectors= MYFS_MAX_FILE_SECTS;
+static int   format      = 0;
 
 module_param(myfs_dev,     charp, 0444);
 module_param(sb_offset_1,  int,   0444);
 module_param(sb_offset_2,  int,   0444);
 module_param(max_name_len, int,   0444);
 module_param(file_sectors, int,   0444);
+module_param(format,       int,   0444);
 
 MODULE_PARM_DESC(myfs_dev,    "Block device name, e.g. loop0 or sdb");
 MODULE_PARM_DESC(sb_offset_1, "Sector for superblock copy 1 (default 0)");
 MODULE_PARM_DESC(sb_offset_2, "Sector for superblock copy 2 (default 1)");
 MODULE_PARM_DESC(max_name_len,"Max filename length (default 64)");
 MODULE_PARM_DESC(file_sectors,"File size in sectors M (default 8)");
+MODULE_PARM_DESC(format,      "1 = (re)format device on mount (default 0)");
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Student");
@@ -84,23 +76,61 @@ MODULE_VERSION("1.2");
  * In-memory структура смонтированной ФС
  * ────────────────────────────────────────────── */
 struct myfs_fs_info {
-    struct myfs_super_block  sb_disk;   /* копия суперблока с диска          */
-    struct file             *bdev_file; /* struct file* — API ядра 6.9+      *
-                                         * открыт через bdev_file_open_by_path */
-    struct block_device     *bdev;      /* file_bdev(bdev_file) — удобный ptr */
-    struct myfs_file_info   *files;     /* массив метаданных файлов           */
-    struct mutex             lock;
+    struct myfs_super_block  sb_disk;     /* копия суперблока с диска          */
+    struct file             *bdev_file;   /* struct file* (API 6.9+)           */
+    struct block_device     *bdev;        /* file_bdev(bdev_file)              */
+    struct myfs_file_info   *files;       /* массив метаданных файлов           */
+    struct mutex             lock;        /* сериализация доступа к ФС/IOCTL    */
     unsigned int             num_files;
+    unsigned int             sector_size; /* реальный размер сектора устройства */
+    bool                     invalidated; /* true после ERASE_FS               */
 };
 
 /* ──────────────────────────────────────────────
- * Работа с диском: чтение / запись секторов
+ * bio I/O: единый примитив чтения/записи
+ *
+ * dev_sector — номер сектора в единицах реального размера сектора
+ * устройства (fsi->sector_size). bio адресуется в 512-байтовых
+ * единицах, поэтому переводим: bi_sector = dev_sector * (sector_size/512).
+ *
+ * buf обязан быть физически непрерывным (kmalloc/kzalloc, НЕ vmalloc),
+ * len — кратен sector_size.
  * ────────────────────────────────────────────── */
+static int myfs_bio_io(struct myfs_fs_info *fsi, sector_t dev_sector,
+                       void *buf, size_t len, blk_opf_t opf)
+{
+    struct bio  *bio;
+    unsigned int per_fs_sector = fsi->sector_size >> SECTOR_SHIFT;
+    sector_t     bi_sector     = dev_sector * per_fs_sector;
+    unsigned int nr_pages      = DIV_ROUND_UP(offset_in_page(buf) + len, PAGE_SIZE);
+    char        *p             = buf;
+    size_t       remaining     = len;
+    int          ret;
+
+    bio = bio_alloc(fsi->bdev, nr_pages, opf, GFP_KERNEL);
+    if (!bio)
+        return -ENOMEM;
+    bio->bi_iter.bi_sector = bi_sector;
+
+    while (remaining) {
+        size_t poff  = offset_in_page(p);
+        size_t chunk = min(remaining, (size_t)(PAGE_SIZE - poff));
+        if (bio_add_page(bio, virt_to_page(p), chunk, poff) != chunk) {
+            bio_put(bio);
+            return -EIO;
+        }
+        p         += chunk;
+        remaining -= chunk;
+    }
+
+    ret = submit_bio_wait(bio);
+    bio_put(bio);
+    return ret;
+}
 
 /*
  * myfs_calc_checksum — XOR всех 32-битных слов суперблока,
- * кроме последнего поля (checksum).  Простая, но эффективная
- * проверка целостности для учебной задачи.
+ * кроме последнего поля (checksum).
  */
 static __u32 myfs_calc_checksum(const struct myfs_super_block *sb)
 {
@@ -113,121 +143,99 @@ static __u32 myfs_calc_checksum(const struct myfs_super_block *sb)
     return result;
 }
 
-/* Читает один 512-байтовый сектор в буфер dst */
-static int myfs_read_sector(struct block_device *bdev, sector_t sec, void *dst)
-{
-    struct buffer_head *bh = __bread(bdev, sec, MYFS_SECTOR_SIZE);
-    if (!bh) {
-        pr_err("myfs: read error sector %llu\n", (unsigned long long)sec);
-        return -EIO;
-    }
-    memcpy(dst, bh->b_data, MYFS_SECTOR_SIZE);
-    brelse(bh);
-    return 0;
-}
+/* ──────────────────────────────────────────────
+ * Чтение / запись данных файла одним батчевым bio
+ * ────────────────────────────────────────────── */
 
-/* Записывает 512 байт из src на диск (синхронно) */
-static int myfs_write_sector(struct block_device *bdev, sector_t sec,
-                              const void *src)
-{
-    struct buffer_head *bh = __bread(bdev, sec, MYFS_SECTOR_SIZE);
-    if (!bh) {
-        pr_err("myfs: write error sector %llu\n", (unsigned long long)sec);
-        return -EIO;
-    }
-    memcpy(bh->b_data, src, MYFS_SECTOR_SIZE);
-    mark_buffer_dirty(bh);
-    sync_dirty_buffer(bh);   /* ждём физической записи */
-    brelse(bh);
-    return 0;
-}
-
-/* Читает все num_sectors секторов файла file_idx в буфер data */
+/* Читает все секторы файла idx в буфер data (size = num_sectors*sector_size) */
 static int myfs_read_file_data(struct myfs_fs_info *fsi, int idx, void *data)
 {
-    struct myfs_file_info *fi = &fsi->files[idx];
-    int i, ret;
-    for (i = 0; i < (int)fi->num_sectors; i++) {
-        ret = myfs_read_sector(fsi->bdev, fi->start_sector + i,
-                               (char *)data + i * MYFS_SECTOR_SIZE);
-        if (ret) return ret;
-    }
-    return 0;
+    struct myfs_file_info *fi  = &fsi->files[idx];
+    size_t                 len = (size_t)fi->num_sectors * fsi->sector_size;
+    return myfs_bio_io(fsi, fi->start_sector, data, len, REQ_OP_READ);
 }
 
 /*
- * Записывает size байт из data в секторы файла.
- * Неполный последний сектор дополняется нулями.
+ * Записывает все секторы файла idx одним bio.
+ * data должен содержать полный размер файла (последний неполный
+ * сектор уже дополнен нулями вызывающей стороной).
  */
-static int myfs_write_file_data(struct myfs_fs_info *fsi, int idx,
-                                const void *data, size_t size)
+static int myfs_write_file_data(struct myfs_fs_info *fsi, int idx, void *data)
 {
-    struct myfs_file_info *fi = &fsi->files[idx];
-    char   buf[MYFS_SECTOR_SIZE];
-    size_t written = 0;
-    int    i, ret;
-
-    for (i = 0; i < (int)fi->num_sectors; i++) {
-        memset(buf, 0, MYFS_SECTOR_SIZE);
-        if (written < size) {
-            size_t chunk = min((size_t)MYFS_SECTOR_SIZE, size - written);
-            memcpy(buf, (const char *)data + written, chunk);
-            written += chunk;
-        }
-        ret = myfs_write_sector(fsi->bdev, fi->start_sector + i, buf);
-        if (ret) return ret;
-    }
-    return 0;
+    struct myfs_file_info *fi  = &fsi->files[idx];
+    size_t                 len = (size_t)fi->num_sectors * fsi->sector_size;
+    return myfs_bio_io(fsi, fi->start_sector, data, len, REQ_OP_WRITE);
 }
 
 /* ──────────────────────────────────────────────
- * Суперблок: запись обеих копий + чтение с верификацией
+ * Суперблок: чтение/проверка/запись копий
  * ────────────────────────────────────────────── */
 
+/* Читает запись суперблока из сектора sec в sb */
+static int myfs_read_sb_copy(struct myfs_fs_info *fsi, __u32 sec,
+                             struct myfs_super_block *sb)
+{
+    void *buf = kzalloc(fsi->sector_size, GFP_KERNEL);
+    int   ret;
+    if (!buf)
+        return -ENOMEM;
+    ret = myfs_bio_io(fsi, sec, buf, fsi->sector_size, REQ_OP_READ);
+    if (!ret)
+        memcpy(sb, buf, sizeof(*sb));
+    kfree(buf);
+    return ret;
+}
+
+/* Записывает запись суперблока в сектор sec (остаток сектора — нули) */
+static int myfs_write_sb_copy(struct myfs_fs_info *fsi, __u32 sec,
+                              const struct myfs_super_block *sb)
+{
+    void *buf = kzalloc(fsi->sector_size, GFP_KERNEL);
+    int   ret;
+    if (!buf)
+        return -ENOMEM;
+    memcpy(buf, sb, sizeof(*sb));
+    ret = myfs_bio_io(fsi, sec, buf, fsi->sector_size, REQ_OP_WRITE);
+    kfree(buf);
+    return ret;
+}
+
+/* Проверяет magic и checksum уже прочитанного суперблока */
+static int myfs_verify_sb(const struct myfs_super_block *sb)
+{
+    if (sb->magic != MYFS_MAGIC)
+        return -EINVAL;
+    if (sb->checksum != myfs_calc_checksum(sb))
+        return -EINVAL;
+    return 0;
+}
+
 /* Пересчитывает checksum и пишет sb в оба сектора */
-static int myfs_write_superblock(struct block_device *bdev,
+static int myfs_write_superblock(struct myfs_fs_info *fsi,
                                  struct myfs_super_block *sb)
 {
     int ret;
     sb->checksum = myfs_calc_checksum(sb);
-    ret = myfs_write_sector(bdev, sb->sb_offset_1, sb);
-    if (ret) return ret;
-    return myfs_write_sector(bdev, sb->sb_offset_2, sb);
+    ret = myfs_write_sb_copy(fsi, sb->sb_offset_1, sb);
+    if (ret)
+        return ret;
+    return myfs_write_sb_copy(fsi, sb->sb_offset_2, sb);
 }
 
-/* Читает суперблок из сектора sec, проверяет magic и checksum */
-static int myfs_read_and_verify_sb(struct block_device *bdev, sector_t sec,
-                                   struct myfs_super_block *sb)
+/*
+ * myfs_format — создание ФС заново: записывает суперблок и зануляет
+ * каждый файл (по одному батчевому bio на файл).
+ */
+static int myfs_format(struct myfs_fs_info *fsi,
+                       __u32 sb1, __u32 sb2, __u32 mname, __u32 fsects)
 {
-    __u32 expected;
-    int   ret = myfs_read_sector(bdev, sec, sb);
-    if (ret) return ret;
-
-    if (sb->magic != MYFS_MAGIC) {
-        pr_warn("myfs: bad magic 0x%08X at sector %llu\n",
-                sb->magic, (unsigned long long)sec);
-        return -EINVAL;
-    }
-    expected = myfs_calc_checksum(sb);
-    if (sb->checksum != expected) {
-        pr_warn("myfs: checksum mismatch sector %llu: stored=0x%08X expected=0x%08X\n",
-                (unsigned long long)sec, sb->checksum, expected);
-        return -EINVAL;
-    }
-    return 0;
-}
-
-/* Первичная инициализация устройства: пишет SB + обнуляет секторы данных */
-static int myfs_format(struct block_device *bdev,
-                       __u32 sb1, __u32 sb2, __u32 mname, __u32 fsects,
-                       struct myfs_super_block *sb_out)
-{
-    struct myfs_super_block sb;
-    char   zero[MYFS_SECTOR_SIZE];
+    struct myfs_super_block *sb = &fsi->sb_disk;
+    void  *zbuf;
     __u32  total, data_start, num_files, i;
+    size_t fsz;
     int    ret;
 
-    total      = (u32)bdev_nr_sectors(bdev);
+    total      = (__u32)(bdev_nr_bytes(fsi->bdev) / fsi->sector_size);
     data_start = max(sb1, sb2) + 1;
 
     if (data_start >= total) {
@@ -240,29 +248,39 @@ static int myfs_format(struct block_device *bdev,
         return -EINVAL;
     }
 
-    memset(&sb, 0, sizeof(sb));
-    sb.magic         = MYFS_MAGIC;
-    sb.version       = 1;
-    sb.sector_size   = MYFS_SECTOR_SIZE;
-    sb.total_sectors = total;
-    sb.sb_offset_1   = sb1;
-    sb.sb_offset_2   = sb2;
-    sb.max_name_len  = mname;
-    sb.file_sectors  = fsects;
-    sb.data_start    = data_start;
-    sb.num_files     = num_files;
+    memset(sb, 0, sizeof(*sb));
+    sb->magic         = MYFS_MAGIC;
+    sb->version       = 1;
+    sb->sector_size   = fsi->sector_size;
+    sb->total_sectors = total;
+    sb->sb_offset_1   = sb1;
+    sb->sb_offset_2   = sb2;
+    sb->max_name_len  = mname;
+    sb->file_sectors  = fsects;
+    sb->data_start    = data_start;
+    sb->num_files     = num_files;
 
-    memset(zero, 0, MYFS_SECTOR_SIZE);
-    for (i = 0; i < num_files * fsects; i++) {
-        ret = myfs_write_sector(bdev, data_start + i, zero);
-        if (ret) return ret;
+    /* Зануление файлов: один батчевый bio на файл */
+    fsz  = (size_t)fsects * fsi->sector_size;
+    zbuf = kzalloc(fsz, GFP_KERNEL);
+    if (!zbuf)
+        return -ENOMEM;
+    for (i = 0; i < num_files; i++) {
+        ret = myfs_bio_io(fsi, data_start + i * fsects, zbuf, fsz,
+                          REQ_OP_WRITE);
+        if (ret) {
+            kfree(zbuf);
+            return ret;
+        }
     }
-    ret = myfs_write_superblock(bdev, &sb);
-    if (ret) return ret;
+    kfree(zbuf);
 
-    memcpy(sb_out, &sb, sizeof(sb));
-    pr_info("myfs: formatted: %u files × %u sectors, data_start=%u\n",
-            num_files, fsects, data_start);
+    ret = myfs_write_superblock(fsi, sb);
+    if (ret)
+        return ret;
+
+    pr_info("myfs: formatted: %u files × %u sectors (sector_size=%u), data_start=%u\n",
+            num_files, fsects, fsi->sector_size, data_start);
     return 0;
 }
 
@@ -272,27 +290,32 @@ static int myfs_format(struct block_device *bdev,
 
 static ssize_t myfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
-    struct inode        *inode    = iocb->ki_filp->f_inode;
-    struct myfs_fs_info *fsi      = inode->i_sb->s_fs_info;
-    int                  idx      = (int)(inode->i_ino - 1);
-    loff_t               pos      = iocb->ki_pos;
+    struct inode        *inode = iocb->ki_filp->f_inode;
+    struct myfs_fs_info *fsi   = inode->i_sb->s_fs_info;
+    int                  idx   = (int)(inode->i_ino - 1);
+    loff_t               pos   = iocb->ki_pos;
     size_t               file_size, count, to_copy;
     char                *buf;
     int                  ret;
 
-    if (idx < 0 || idx >= (int)fsi->num_files) return -EINVAL;
+    if (idx < 0 || idx >= (int)fsi->num_files)
+        return -EINVAL;
+    if (fsi->invalidated)
+        return -EIO;
 
-    file_size = (size_t)fsi->files[idx].num_sectors * MYFS_SECTOR_SIZE;
-    if (pos >= (loff_t)file_size) return 0;
+    file_size = (size_t)fsi->files[idx].num_sectors * fsi->sector_size;
+    if (pos >= (loff_t)file_size)
+        return 0;
 
     count   = iov_iter_count(to);
     to_copy = min(count, (size_t)(file_size - pos));
 
     buf = kmalloc(file_size, GFP_KERNEL);
-    if (!buf) return -ENOMEM;
+    if (!buf)
+        return -ENOMEM;
 
     mutex_lock(&fsi->lock);
-    ret = myfs_read_file_data(fsi, idx, buf);
+    ret = fsi->invalidated ? -EIO : myfs_read_file_data(fsi, idx, buf);
     mutex_unlock(&fsi->lock);
     if (ret) { kfree(buf); return ret; }
 
@@ -306,33 +329,48 @@ static ssize_t myfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 static ssize_t myfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
-    struct inode        *inode    = iocb->ki_filp->f_inode;
-    struct myfs_fs_info *fsi      = inode->i_sb->s_fs_info;
-    int                  idx      = (int)(inode->i_ino - 1);
-    loff_t               pos      = iocb->ki_pos;
+    struct inode        *inode = iocb->ki_filp->f_inode;
+    struct myfs_fs_info *fsi   = inode->i_sb->s_fs_info;
+    int                  idx   = (int)(inode->i_ino - 1);
+    loff_t               pos   = iocb->ki_pos;
     size_t               file_size, count, to_write;
     char                *buf;
     int                  ret;
 
-    if (idx < 0 || idx >= (int)fsi->num_files) return -EINVAL;
+    if (idx < 0 || idx >= (int)fsi->num_files)
+        return -EINVAL;
+    if (fsi->invalidated)
+        return -EIO;
 
-    file_size = (size_t)fsi->files[idx].num_sectors * MYFS_SECTOR_SIZE;
-    if (pos >= (loff_t)file_size) return -ENOSPC;
+    /*
+     * Позиция берётся из iocb->ki_pos и наращивается на число
+     * записанных байт (ниже). При O_APPEND VFS передаёт ki_pos = f_pos,
+     * который корректно продвигается между последовательными записями
+     * и не сбрасывается в начало. Файлы фиксированного размера, поэтому
+     * запись за пределы ёмкости → -ENOSPC.
+     */
+    file_size = (size_t)fsi->files[idx].num_sectors * fsi->sector_size;
+    if (pos >= (loff_t)file_size)
+        return -ENOSPC;
 
     count    = iov_iter_count(from);
     to_write = min(count, (size_t)(file_size - pos));
 
     buf = kmalloc(file_size, GFP_KERNEL);
-    if (!buf) return -ENOMEM;
+    if (!buf)
+        return -ENOMEM;
 
     mutex_lock(&fsi->lock);
+    if (fsi->invalidated) { ret = -EIO; goto out; }
+
+    /* read-modify-write: дочитываем существующее содержимое */
     ret = myfs_read_file_data(fsi, idx, buf);
     if (ret) goto out;
 
     if (copy_from_iter(buf + pos, to_write, from) != to_write)
         { ret = -EFAULT; goto out; }
 
-    ret = myfs_write_file_data(fsi, idx, buf, file_size);
+    ret = myfs_write_file_data(fsi, idx, buf);
     if (!ret) {
         iocb->ki_pos += to_write;
         fsi->files[idx].crc32 = crc32(0, buf, file_size);
@@ -356,9 +394,6 @@ static const struct inode_operations myfs_file_inode_ops = {
 
 /* ──────────────────────────────────────────────
  * VFS: создание inode для файла
- *
- * С ядра 6.6 поля i_atime/i_mtime/i_ctime убраны из struct inode.
- * Используем inode_set_{a,m,c}time_to_ts() вместо прямого присваивания.
  * ────────────────────────────────────────────── */
 static struct inode *myfs_get_inode(struct super_block *sb, int idx)
 {
@@ -366,14 +401,15 @@ static struct inode *myfs_get_inode(struct super_block *sb, int idx)
     struct myfs_file_info *fi  = &fsi->files[idx];
     struct timespec64      ts;
     struct inode          *inode = new_inode(sb);
-    if (!inode) return NULL;
+    if (!inode)
+        return NULL;
 
     inode->i_ino    = (unsigned long)(idx + 1);
     inode->i_mode   = S_IFREG | 0666;
     inode->i_uid    = GLOBAL_ROOT_UID;
     inode->i_gid    = GLOBAL_ROOT_GID;
-    inode->i_size   = (loff_t)fi->num_sectors * MYFS_SECTOR_SIZE;
-    inode->i_blocks = fi->num_sectors;
+    inode->i_size   = (loff_t)fi->num_sectors * fsi->sector_size;
+    inode->i_blocks = (blkcnt_t)fi->num_sectors * (fsi->sector_size >> 9);
 
     ts = current_time(inode);
     inode_set_atime_to_ts(inode, ts);
@@ -392,14 +428,20 @@ static struct inode *myfs_get_inode(struct super_block *sb, int idx)
 static int myfs_readdir(struct file *file, struct dir_context *ctx)
 {
     struct myfs_fs_info *fsi = file->f_inode->i_sb->s_fs_info;
-    unsigned int i;
+    unsigned int         i;
 
-    if (!dir_emit_dots(file, ctx)) return 0;
+    if (!dir_emit_dots(file, ctx))
+        return 0;
 
-    for (i = 0; i < fsi->num_files; i++) {
+    /* После ERASE_FS ФС инвалидирована — файлы не показываем */
+    if (fsi->invalidated)
+        return 0;
+
+    /* ctx->pos: 0 и 1 — "." и "..", далее i = pos - 2 */
+    for (i = ctx->pos - 2; i < fsi->num_files; i++) {
         struct myfs_file_info *fi = &fsi->files[i];
-        if (ctx->pos > (loff_t)(i + 2)) continue;
-        if (!dir_emit(ctx, fi->name, strlen(fi->name), (ino_t)(i + 1), DT_REG))
+        if (!dir_emit(ctx, fi->name, strlen(fi->name),
+                      (ino_t)(i + 1), DT_REG))
             return 0;
         ctx->pos++;
     }
@@ -410,13 +452,16 @@ static struct dentry *myfs_lookup(struct inode *dir, struct dentry *dentry,
                                   unsigned int flags)
 {
     struct myfs_fs_info *fsi = dir->i_sb->s_fs_info;
-    unsigned int i;
+    unsigned int         i;
 
-    for (i = 0; i < fsi->num_files; i++) {
-        if (strcmp(fsi->files[i].name, dentry->d_name.name) == 0) {
-            struct inode *inode = myfs_get_inode(dir->i_sb, (int)i);
-            if (!inode) return ERR_PTR(-ENOMEM);
-            return d_splice_alias(inode, dentry);
+    if (!fsi->invalidated) {
+        for (i = 0; i < fsi->num_files; i++) {
+            if (strcmp(fsi->files[i].name, dentry->d_name.name) == 0) {
+                struct inode *inode = myfs_get_inode(dir->i_sb, (int)i);
+                if (!inode)
+                    return ERR_PTR(-ENOMEM);
+                return d_splice_alias(inode, dentry);
+            }
         }
     }
     d_add(dentry, NULL);   /* negative dentry — файл не найден */
@@ -438,86 +483,113 @@ static const struct inode_operations myfs_dir_inode_ops = {
  * ────────────────────────────────────────────── */
 
 static struct myfs_fs_info *g_fsi = NULL;
+static DEFINE_MUTEX(g_fsi_lock);   /* защищает указатель g_fsi */
 
 static long myfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-    struct myfs_fs_info *fsi = g_fsi;
+    struct myfs_fs_info *fsi;
     __u32 i;
     int   ret = 0;
 
-    if (!fsi) return -ENODEV;
+    /* Захватываем актуальный смонтированный экземпляр ФС */
+    mutex_lock(&g_fsi_lock);
+    fsi = g_fsi;
+    if (fsi)
+        mutex_lock(&fsi->lock);
+    mutex_unlock(&g_fsi_lock);
+
+    if (!fsi)
+        return -ENODEV;
+    if (fsi->invalidated && cmd != MYFS_IOC_ERASE_FS) {
+        mutex_unlock(&fsi->lock);
+        return -ENODEV;
+    }
 
     switch (cmd) {
 
-    /* ── Обнулить все файлы ── */
+    /* ── Обнулить все файлы (батчевый bio на файл) ── */
     case MYFS_IOC_ZERO_ALL: {
-        size_t fsz = (size_t)fsi->sb_disk.file_sectors * MYFS_SECTOR_SIZE;
-        char *zbuf = kzalloc(fsz, GFP_KERNEL);
-        if (!zbuf) return -ENOMEM;
-        mutex_lock(&fsi->lock);
+        size_t fsz  = (size_t)fsi->sb_disk.file_sectors * fsi->sector_size;
+        char  *zbuf = kzalloc(fsz, GFP_KERNEL);
+        if (!zbuf) { ret = -ENOMEM; break; }
         for (i = 0; i < fsi->num_files && !ret; i++) {
-            ret = myfs_write_file_data(fsi, (int)i, zbuf, fsz);
+            ret = myfs_write_file_data(fsi, (int)i, zbuf);
             if (!ret)
                 fsi->files[i].crc32 = crc32(0, zbuf, fsz);
         }
-        mutex_unlock(&fsi->lock);
         kfree(zbuf);
         pr_info("myfs: ZERO_ALL done\n");
         break;
     }
 
-    /* ── Стереть ФС — обнулить оба суперблока ── */
+    /* ── Стереть ФС: обнулить оба суперблока + инвалидировать ── */
     case MYFS_IOC_ERASE_FS: {
-        char sec[MYFS_SECTOR_SIZE];
-        memset(sec, 0, sizeof(sec));
-        mutex_lock(&fsi->lock);
-        myfs_write_sector(fsi->bdev, fsi->sb_disk.sb_offset_1, sec);
-        myfs_write_sector(fsi->bdev, fsi->sb_disk.sb_offset_2, sec);
-        mutex_unlock(&fsi->lock);
-        pr_info("myfs: ERASE_FS done\n");
+        void *sec = kzalloc(fsi->sector_size, GFP_KERNEL);
+        if (!sec) { ret = -ENOMEM; break; }
+        myfs_bio_io(fsi, fsi->sb_disk.sb_offset_1, sec, fsi->sector_size,
+                    REQ_OP_WRITE);
+        myfs_bio_io(fsi, fsi->sb_disk.sb_offset_2, sec, fsi->sector_size,
+                    REQ_OP_WRITE);
+        kfree(sec);
+        fsi->invalidated = true;   /* файлы исчезают, I/O запрещён до re-mount */
+        pr_info("myfs: ERASE_FS done — filesystem invalidated, re-mount required\n");
         break;
     }
 
     /* ── Метаинформация (CRC32) всех файлов ── */
     case MYFS_IOC_GET_META: {
         struct myfs_file_info __user *uinfo = (struct myfs_file_info __user *)arg;
-        size_t fsz = (size_t)fsi->sb_disk.file_sectors * MYFS_SECTOR_SIZE;
-        char *buf  = kmalloc(fsz, GFP_KERNEL);
-        if (!buf) return -ENOMEM;
-        mutex_lock(&fsi->lock);
+        size_t fsz = (size_t)fsi->sb_disk.file_sectors * fsi->sector_size;
+        char  *buf = kmalloc(fsz, GFP_KERNEL);
+        if (!buf) { ret = -ENOMEM; break; }
         for (i = 0; i < fsi->num_files; i++) {
             if (!myfs_read_file_data(fsi, (int)i, buf))
                 fsi->files[i].crc32 = crc32(0, buf, fsz);
             if (copy_to_user(&uinfo[i], &fsi->files[i],
                              sizeof(struct myfs_file_info))) {
-                ret = -EFAULT; break;
+                ret = -EFAULT;
+                break;
             }
         }
-        mutex_unlock(&fsi->lock);
         kfree(buf);
-        pr_info("myfs: GET_META done\n");
+        pr_info("myfs: GET_META done (%u files)\n", fsi->num_files);
         break;
     }
 
-    /* ── Маппинг секторов для файла ── */
+    /* ── Маппинг секторов для файла (по имени) ── */
     case MYFS_IOC_GET_SECTOR_MAP: {
         struct myfs_sector_map map;
-        if (copy_from_user(&map, (void __user *)arg, sizeof(map)))
-            return -EFAULT;
-        if (map.file_index >= fsi->num_files)
-            return -EINVAL;
-        map.start_sector = fsi->files[map.file_index].start_sector;
-        map.num_sectors  = fsi->files[map.file_index].num_sectors;
-        if (copy_to_user((void __user *)arg, &map, sizeof(map)))
-            return -EFAULT;
-        pr_info("myfs: GET_SECTOR_MAP file=%u → start=%u nsect=%u\n",
-                map.file_index, map.start_sector, map.num_sectors);
+        bool found = false;
+        if (copy_from_user(&map, (void __user *)arg, sizeof(map))) {
+            ret = -EFAULT;
+            break;
+        }
+        map.name[sizeof(map.name) - 1] = '\0';
+        for (i = 0; i < fsi->num_files; i++) {
+            if (strcmp(fsi->files[i].name, map.name) == 0) {
+                map.file_index   = i;
+                map.start_sector = fsi->files[i].start_sector;
+                map.num_sectors  = fsi->files[i].num_sectors;
+                map.sector_size  = fsi->sector_size;
+                found = true;
+                break;
+            }
+        }
+        if (!found) { ret = -ENOENT; break; }
+        if (copy_to_user((void __user *)arg, &map, sizeof(map))) {
+            ret = -EFAULT;
+            break;
+        }
+        pr_info("myfs: GET_SECTOR_MAP '%s' → idx=%u start=%u nsect=%u\n",
+                map.name, map.file_index, map.start_sector, map.num_sectors);
         break;
     }
 
     default:
         ret = -ENOTTY;
     }
+
+    mutex_unlock(&fsi->lock);
     return ret;
 }
 
@@ -539,19 +611,23 @@ static struct miscdevice myfs_miscdev = {
 static void myfs_put_super(struct super_block *sb)
 {
     struct myfs_fs_info *fsi = sb->s_fs_info;
+
+    mutex_lock(&g_fsi_lock);
+    if (g_fsi == fsi)
+        g_fsi = NULL;
+    mutex_unlock(&g_fsi_lock);
+
     if (fsi) {
-        /*
-         * Закрываем блочное устройство.
-         * API 6.9+: bdev_file_open_by_path вернул struct file* →
-         * освобождаем через fput().
-         */
+        /* Дожидаемся завершения IOCTL, удерживающего мьютекс ФС */
+        mutex_lock(&fsi->lock);
+        mutex_unlock(&fsi->lock);
         if (fsi->bdev_file)
             fput(fsi->bdev_file);
+        mutex_destroy(&fsi->lock);
         kfree(fsi->files);
         kfree(fsi);
         sb->s_fs_info = NULL;
     }
-    g_fsi = NULL;
     pr_info("myfs: unmounted\n");
 }
 
@@ -561,17 +637,6 @@ static const struct super_operations myfs_super_ops = {
     .drop_inode = generic_drop_inode,
 };
 
-/*
- * myfs_fill_super — инициализация суперблока VFS при mount(2).
- *
- * Открытие блочного устройства (API 6.9+ / ядро 6.12):
- *   struct file *f = bdev_file_open_by_path(path, flags, holder, hops);
- *   struct block_device *bdev = file_bdev(f);
- *   ...
- *   fput(f);   ← при закрытии
- *
- * Версии до 6.9 использовали bdev_handle; до 6.5 — blkdev_get_by_path.
- */
 static int myfs_fill_super(struct super_block *sb, void *data, int silent)
 {
     struct myfs_fs_info     *fsi;
@@ -581,18 +646,11 @@ static int myfs_fill_super(struct super_block *sb, void *data, int silent)
     struct file             *bdev_file;
     struct timespec64        ts;
     char                     dev_path[80];
-    bool                     need_format = false;
     unsigned int             i;
     int                      ret;
 
     snprintf(dev_path, sizeof(dev_path), "/dev/%s", myfs_dev);
 
-    /*
-     * bdev_file_open_by_path — актуальный API начиная с ядра 6.9.
-     * Возвращает struct file* (или ERR_PTR).
-     * Получить block_device*: file_bdev(f).
-     * Закрыть: fput(f).
-     */
     bdev_file = bdev_file_open_by_path(dev_path,
                                        BLK_OPEN_READ | BLK_OPEN_WRITE,
                                        NULL, NULL);
@@ -604,28 +662,62 @@ static int myfs_fill_super(struct super_block *sb, void *data, int silent)
     fsi = kzalloc(sizeof(*fsi), GFP_KERNEL);
     if (!fsi) { ret = -ENOMEM; goto err_bdev; }
 
-    fsi->bdev_file = bdev_file;
-    fsi->bdev      = file_bdev(bdev_file); /* получаем block_device* из file* */
+    fsi->bdev_file   = bdev_file;
+    fsi->bdev        = file_bdev(bdev_file);
+    fsi->invalidated = false;
     mutex_init(&fsi->lock);
     disk_sb = &fsi->sb_disk;
 
-    /* Пробуем копию 1, затем копию 2, иначе форматируем */
-    ret = myfs_read_and_verify_sb(fsi->bdev, (sector_t)sb_offset_1, disk_sb);
-    if (ret) {
-        pr_warn("myfs: primary SB invalid, trying backup\n");
-        ret = myfs_read_and_verify_sb(fsi->bdev, (sector_t)sb_offset_2, disk_sb);
-        if (ret) {
-            pr_info("myfs: no valid SB found, formatting...\n");
-            need_format = true;
-        }
+    /* Размер сектора определяем автоматически с устройства */
+    fsi->sector_size = bdev_logical_block_size(fsi->bdev);
+    if (fsi->sector_size < 512 || (fsi->sector_size & (fsi->sector_size - 1))) {
+        pr_err("myfs: unsupported logical block size %u\n", fsi->sector_size);
+        ret = -EINVAL;
+        goto err_fsi;
     }
 
-    if (need_format) {
-        ret = myfs_format(fsi->bdev,
-                          (__u32)sb_offset_1, (__u32)sb_offset_2,
-                          (__u32)max_name_len, (__u32)file_sectors,
-                          disk_sb);
-        if (ret) goto err_fsi;
+    if (format) {
+        /* Явный запрос на форматирование */
+        pr_info("myfs: format=1 — (re)formatting %s\n", dev_path);
+        ret = myfs_format(fsi, (__u32)sb_offset_1, (__u32)sb_offset_2,
+                          (__u32)max_name_len, (__u32)file_sectors);
+        if (ret)
+            goto err_fsi;
+    } else {
+        /*
+         * Логика выбора суперблока:
+         *   первичный исправен          → использовать его;
+         *   первичный битый, резерв ОК   → использовать резерв и
+         *                                  ВОССТАНОВИТЬ первичный;
+         *   обе копии битые              → ошибка монтирования,
+         *                                  НЕ форматировать (данные не теряем).
+         */
+        ret = myfs_read_sb_copy(fsi, (__u32)sb_offset_1, disk_sb);
+        if (ret || myfs_verify_sb(disk_sb)) {
+            struct myfs_super_block backup;
+            pr_warn("myfs: primary SB invalid, trying backup\n");
+            ret = myfs_read_sb_copy(fsi, (__u32)sb_offset_2, &backup);
+            if (ret || myfs_verify_sb(&backup)) {
+                pr_err("myfs: both superblocks invalid — refusing to mount "
+                       "(use format=1 to create a new filesystem)\n");
+                ret = -EINVAL;
+                goto err_fsi;
+            }
+            *disk_sb = backup;
+            /* Восстанавливаем первичную копию из резервной */
+            ret = myfs_write_sb_copy(fsi, disk_sb->sb_offset_1, disk_sb);
+            if (ret)
+                pr_warn("myfs: failed to restore primary SB: %d\n", ret);
+            else
+                pr_info("myfs: primary SB restored from backup\n");
+        }
+        /* Доверяем размеру сектора из суперблока, но сверяем с устройством */
+        if (disk_sb->sector_size != fsi->sector_size) {
+            pr_err("myfs: SB sector_size %u != device %u — refusing to mount\n",
+                   disk_sb->sector_size, fsi->sector_size);
+            ret = -EINVAL;
+            goto err_fsi;
+        }
     }
 
     fsi->num_files = disk_sb->num_files;
@@ -635,19 +727,21 @@ static int myfs_fill_super(struct super_block *sb, void *data, int silent)
     if (!fsi->files) { ret = -ENOMEM; goto err_fsi; }
 
     for (i = 0; i < fsi->num_files; i++) {
+        size_t cap = min((size_t)disk_sb->max_name_len,
+                         sizeof(fsi->files[i].name));
         fsi->files[i].index        = i;
         fsi->files[i].start_sector = disk_sb->data_start + i * disk_sb->file_sectors;
         fsi->files[i].num_sectors  = disk_sb->file_sectors;
-        snprintf(fsi->files[i].name, disk_sb->max_name_len, "file%05u", i);
+        snprintf(fsi->files[i].name, cap, "file%05u", i);
     }
 
     /* Настраиваем VFS суперблок */
     sb->s_magic          = MYFS_MAGIC;
     sb->s_op             = &myfs_super_ops;
     sb->s_fs_info        = fsi;
-    sb->s_blocksize      = MYFS_SECTOR_SIZE;
-    sb->s_blocksize_bits = blksize_bits(MYFS_SECTOR_SIZE);
-    sb->s_maxbytes       = (loff_t)disk_sb->file_sectors * MYFS_SECTOR_SIZE;
+    sb->s_blocksize      = fsi->sector_size;
+    sb->s_blocksize_bits = blksize_bits(fsi->sector_size);
+    sb->s_maxbytes       = (loff_t)disk_sb->file_sectors * fsi->sector_size;
 
     /* Корневой inode (директория) */
     root_inode = new_inode(sb);
@@ -665,22 +759,26 @@ static int myfs_fill_super(struct super_block *sb, void *data, int silent)
     root_inode->i_fop  = &myfs_dir_ops;
     set_nlink(root_inode, 2);
 
-    root_dentry = d_make_root(root_inode);
+    root_dentry = d_make_root(root_inode);   /* при ошибке сам делает iput */
     if (!root_dentry) { ret = -ENOMEM; goto err_files; }
 
     sb->s_root = root_dentry;
-    g_fsi = fsi;
 
-    pr_info("myfs: mounted %s — %u files × %u sectors\n",
-            dev_path, fsi->num_files, disk_sb->file_sectors);
+    mutex_lock(&g_fsi_lock);
+    g_fsi = fsi;
+    mutex_unlock(&g_fsi_lock);
+
+    pr_info("myfs: mounted %s — %u files × %u sectors (sector_size=%u)\n",
+            dev_path, fsi->num_files, disk_sb->file_sectors, fsi->sector_size);
     return 0;
 
 err_files:
     kfree(fsi->files);
 err_fsi:
+    mutex_destroy(&fsi->lock);
     kfree(fsi);
 err_bdev:
-    fput(bdev_file);   /* fput вместо bdev_release/blkdev_put */
+    fput(bdev_file);
     return ret;
 }
 
@@ -713,8 +811,8 @@ static int __init myfs_init(void)
         return ret;
     }
 
-    pr_info("myfs: loaded dev=/dev/%s sb1=%d sb2=%d names=%d sects=%d\n",
-            myfs_dev, sb_offset_1, sb_offset_2, max_name_len, file_sectors);
+    pr_info("myfs: loaded dev=/dev/%s sb1=%d sb2=%d names=%d sects=%d format=%d\n",
+            myfs_dev, sb_offset_1, sb_offset_2, max_name_len, file_sectors, format);
     return 0;
 }
 
